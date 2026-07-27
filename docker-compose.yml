@@ -1,0 +1,26 @@
+services:
+  frontend:
+    build: ./frontend
+    container_name: devops_node_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - BACKEND_URL=http://backend:5001/api/submit
+    depends_on:
+      - backend
+    networks:
+      - devops_bridge_net
+
+  backend:
+    build: ./backend
+    container_name: devops_flask_backend
+    ports:
+      - "5001:5001"
+    environment:
+      - MONGO_URI=mongodb+srv://ashwinsh91_db_user:NH56mlwbxJFyhORv@cluster0.9n2vi99.mongodb.net/tutedude?retryWrites=true&w=majority
+    networks:
+      - devops_bridge_net
+
+networks:
+  devops_bridge_net:
+    driver: bridge
