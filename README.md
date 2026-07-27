@@ -1,4 +1,4 @@
-# Assignment-5 — Dockerized Full-Stack App
+# Tutedude - Flask App
 
 A full-stack web application containerized with Docker and orchestrated via Docker Compose. Users submit a form through a Node.js/Express frontend, which forwards the data to a Python/Flask backend that persists it to a MongoDB Atlas cluster.
 
