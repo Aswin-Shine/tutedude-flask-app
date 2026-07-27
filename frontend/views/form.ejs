@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Multi-Container App</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 50px; background-color: #f4f6f9; }
+        .wrapper { max-width: 400px; padding: 25px; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
+        .error { color: white; background: #d9534f; padding: 10px; margin-bottom: 15px; border-radius: 4px; }
+        .field { margin-bottom: 15px; }
+        .field label { display: block; margin-bottom: 5px; font-weight: bold; }
+        .field input { width: 95%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        button { width: 100%; background: #28a745; color: white; padding: 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+    </style>
+</head>
+<body>
+
+    <div class="wrapper">
+        <h2>Node to Flask Database Pipeline</h2>
+        
+        <% if (error) { %>
+            <div class="error">
+                <strong>Error:</strong> <%= error %>
+            </div>
+        <% } %>
+
+        <form action="/submit" method="POST">
+            <div class="field">
+                <label>Username:</label>
+                <input type="text" name="username" required>
+            </div>
+            <div class="field">
+                <label>Email Address:</label>
+                <input type="email" name="email" required>
+            </div>
+            <button type="submit">Deploy Content</button>
+        </form>
+    </div>
+
+</body>
+</html>
