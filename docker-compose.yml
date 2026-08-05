@@ -1,6 +1,6 @@
 services:
   frontend:
-    build: ./frontend
+    image: aswinshine/node-frontend:v1
     container_name: devops_node_frontend
     ports:
       - "3000:3000"
@@ -12,7 +12,7 @@ services:
       - devops_bridge_net
 
   backend:
-    build: ./backend
+    image: aswinshine/flask-backend:v1
     container_name: devops_flask_backend
     ports:
       - "5001:5001"
