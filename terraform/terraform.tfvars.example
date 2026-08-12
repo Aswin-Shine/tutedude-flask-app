@@ -1,0 +1,10 @@
+aws_region       = "eu-north-1"
+project_name     = "tutedude-cicd"
+instance_type    = "m7i-flex.large" 
+key_name         = "your-ec2-keypair-name"
+allowed_ssh_cidr = "YOUR_IP/32"
+github_repo_url  = "https://github.com/Aswin-Shine/tutedude-flask-app.git"
+backend_port     = 5000
+frontend_port    = 3000
+jenkins_port     = 8080
+mongo_uri        = "mongodb+srv://<user>:<password>@<cluster>.mongodb.net/<db>?retryWrites=true&w=majority"
