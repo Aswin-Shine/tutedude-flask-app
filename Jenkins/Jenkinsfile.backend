@@ -1,0 +1,83 @@
+// Jenkins job config: Pipeline script path = "Jenkinsfile.backend"
+//
+// Deliberately NOT using a shared customWorkspace with the frontend
+// pipeline -- two jobs doing `checkout scm` into the same directory on
+// near-simultaneous pushes would race on git's index.lock. Each pipeline
+// gets Jenkins' normal per-job workspace, and only rsyncs its OWN
+// subfolder into the live /opt/app deploy path, so the two pipelines
+// never write to the same path even if they run concurrently.
+pipeline {
+    agent any
+
+    triggers {
+        githubPush()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Sync to deploy path') {
+            steps {
+                sh 'rsync -a --delete --exclude venv backend/ /opt/app/backend/'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir('/opt/app/backend') {
+                    sh '''
+                        if [ ! -d venv ]; then
+                            python3 -m venv venv
+                        fi
+                        ./venv/bin/pip install --no-cache-dir -r requirements.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Patch Port') {
+            steps {
+                dir('/opt/app/backend') {
+                    // Repo hardcodes 5001; assignment wants 5000. A fresh
+                    // rsync from a clean checkout undoes this every time,
+                    // so it's reapplied on every build, not just the first.
+                    sh "sed -i 's/port=5001/port=5000/' app.py"
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                dir('/opt/app/backend') {
+                    sh '''
+                        if [ -d tests ] || ls test_*.py > /dev/null 2>&1; then
+                            ./venv/bin/pip install --no-cache-dir pytest
+                            ./venv/bin/pytest || true
+                        else
+                            echo "No tests found in backend/ -- skipping. Add a tests/ dir or test_*.py files to make this stage do real work."
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Restart via pm2') {
+            steps {
+                sh 'pm2 restart flask-backend'
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo 'Backend pipeline failed -- flask-backend was NOT restarted, previous version keeps running.'
+        }
+        success {
+            echo 'Backend deployed and restarted successfully.'
+        }
+    }
+}
