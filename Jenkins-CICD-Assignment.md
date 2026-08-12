@@ -68,6 +68,10 @@ terraform plan
 terraform apply -var-file=terraform.tfvars
 ```
 
+![terraform apply running](./Screenshots/Terraform-1.png)
+
+![terraform apply finished, outputs shown](./Screenshots/Terraform-1.1.png)
+
 `terraform.tfvars` needs `key_name` and `allowed_ssh_cidr` set to real values, and `mongo_uri` set to the real Atlas connection string. None of these have defaults on purpose, mostly so I don't accidentally commit a real value into `variables.tf`, which does get pushed to GitHub. `terraform.tfvars` itself is gitignored.
 
 ## Part 2: Jenkins setup
@@ -167,6 +171,8 @@ The venv gets excluded from the rsync `--delete` so it doesn't get wiped and reb
 
 The test stage is honestly not doing much right now, the app doesn't have any tests yet, so it just checks whether a `tests/` folder or `test_*.py` files exist and skips cleanly if not, instead of failing the whole pipeline over something that was never there. If I add real tests later this stage would actually run them.
 
+![backend job build history in Jenkins](./Screenshots/Backend-Job.png)
+
 ### Jenkinsfile.frontend
 
 ```groovy
@@ -232,14 +238,33 @@ pipeline {
 
 Same idea as the backend one, just no port patch needed since Express is already on the right port (3000) by default in this repo.
 
+![frontend job build history in Jenkins](./Screenshots/Frontend-Job.png)
+
+### GitHub webhook
+
+Repo Settings, Webhooks, Add webhook, Payload URL `http://<instance-ip>:8080/github-webhook/`, content type `application/json`, trigger on push.
+
+![adding the webhook in GitHub](./Screenshots/Webhook.png)
+
+![webhook showing a successful delivery](./Screenshots/Webhook-1.1.png)
+
+![webhook recent deliveries log](./Screenshots/Webhook-1.2.png)
+
 ## What I'd still want to fix
 
 I'm not going to pretend this setup is production ready, because it isn't, and I think that's fine for what this assignment is asking for, but worth being upfront about:
 
 - Everything, Jenkins, the frontend, and the backend, lives on one instance. If that instance runs out of disk from Jenkins build history, or Jenkins itself crashes, the live apps go down with it. In a real setup I'd want the CI runner separate from wherever the app actually runs.
-
 - Jenkins' login page is open to the whole internet on port 8080, since the GitHub webhook needs a way to reach it. That's a real tradeoff, not something I've solved, just something I'm aware of.
-
 - There's no rollback if a bad deploy gets pushed through. Right now the test stage barely does anything since there aren't real tests yet, so a broken commit would probably just get deployed straight to pm2.
-
 - The port patch (`sed`ing 5001 to 5000) happens in two places now, the boot script and the backend Jenkinsfile, because both need it independently. If that exact line in `app.py` ever gets rewritten slightly, the sed just quietly stops matching and does nothing, no error, the app just comes up on the wrong port with no obvious explanation. The actual fix would be reading the port from an environment variable in the app itself instead of patching around it after the fact, I just didn't want to change the app code for a one-off assignment requirement.
+
+<div align="center">
+
+## Project screenshots
+
+</div>
+
+![app running end to end](./Screenshots/Project-ss-1.png)
+
+![app running end to end, second view](./Screenshots/Project-ss-2.png)
