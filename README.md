@@ -1,91 +1,101 @@
-# Tutedude - Flask App
+# Tutedude Flask App
 
-A full-stack web application containerized with Docker and orchestrated via Docker Compose. Users submit a form through a Node.js/Express frontend, which forwards the data to a Python/Flask backend that persists it to a MongoDB Atlas cluster.
+A full-stack app with a Node/Express frontend and a Python/Flask backend, backed by MongoDB Atlas. Users fill in a form on the frontend, the frontend forwards it to the backend over HTTP, and the backend writes it to Atlas.
 
----
+The app itself is small. What's in this repo is really three different ways to run it: locally with Docker Compose, on a Kubernetes cluster, or fully automated on AWS EC2 with Jenkins doing continuous deployment. Each of those lives in its own part of the repo and doesn't depend on the others.
 
 ## Architecture
 
 ```
 Browser
-  └── Frontend (Node.js + Express + EJS)  :3000
-        └── HTTP POST via Axios
-              └── Backend (Python + Flask)  :5001
-                    └── MongoDB Atlas (Cloud)
+  --> Frontend (Node.js + Express + EJS)   :3000
+        --> HTTP POST via Axios
+              --> Backend (Python + Flask)  :5001 (or :5000, see note below)
+                    --> MongoDB Atlas (cloud, external to all of this)
 ```
 
-All services communicate over a custom Docker bridge network (`devops_bridge_net`). The frontend reaches the backend using Docker Compose's internal DNS (`http://backend:5001`).
+MongoDB Atlas isn't part of this repo's infrastructure. It's a separate cloud cluster the backend connects to over the internet with a connection string.
 
----
+A note on ports: the backend's code hardcodes port 5001. The Docker Compose and Kubernetes setups use that as-is. The Terraform/Jenkins EC2 deployment patches the running copy to port 5000 instead, since that's what that specific assignment required, without changing the actual `app.py` in this repo. If you're running this locally or on Kubernetes, it's on 5001. If you're running it through the Terraform setup, it's on 5000.
 
-## Project Structure
+## Project structure
 
 ```
-Assignment-5-app/
-├── docker-compose.yml
-├── backend/
-│   ├── Dockerfile
+.
+├── backend/                      Flask API
 │   ├── app.py
-│   └── requirements.txt
-└── frontend/
-    ├── Dockerfile
-    ├── package.json
-    ├── server.js
-    └── views/
-        └── form.ejs
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/                     Express frontend
+│   ├── server.js
+│   ├── package.json
+│   ├── views/form.ejs
+│   └── Dockerfile
+├── docker-compose.yml            run both locally with one command
+├── k8s/                          Kubernetes manifests
+│   ├── backend-deployment.yaml
+│   ├── backend-service.yaml
+│   ├── frontend-deployment.yaml
+│   └── frontend-service.yaml
+├── terraform/                    provisions a single EC2 instance running both apps + Jenkins
+│   ├── main.tf, variables.tf, outputs.tf, provider.tf, versions.tf, backend.tf
+│   ├── templates/user_data.sh.tpl
+│   └── terraform.tfvars.example
+├── Jenkins/
+│   ├── Jenkinsfile.backend
+│   └── Jenkinsfile.frontend
+└── README.md                     this file
 ```
-
----
 
 ## Frontend
 
 **Stack:** Node.js 18, Express, EJS, Axios
 
-The frontend is a lightweight Express server that renders an EJS form. On submission it proxies the payload to the Flask backend via Axios and displays either a success message or an inline error.
+A small Express server that renders a form and, on submit, forwards the data to the Flask backend with Axios.
 
-| File         | Purpose                                      |
-|--------------|----------------------------------------------|
-| `server.js`  | Express server, routes `GET /` and `POST /submit` |
-| `views/form.ejs` | HTML form — collects username and email  |
-| `package.json` | Dependencies: express, ejs, axios          |
-| `Dockerfile` | Node 18 Alpine image, exposes port 3000      |
+| File | Purpose |
+|---|---|
+| `server.js` | Express app, routes `GET /` and `POST /submit` |
+| `views/form.ejs` | The actual form, collects username and email |
+| `package.json` | Dependencies: express, ejs, axios |
+| `Dockerfile` | Node 18, exposes port 3000 |
 
-**Key environment variable:**
+**Environment variable:**
 
-| Variable       | Default                             | Description                        |
-|----------------|-------------------------------------|------------------------------------|
-| `BACKEND_URL`  | `http://backend:5001/api/submit`    | Internal Docker DNS to Flask API   |
+| Variable | Default | What it's for |
+|---|---|---|
+| `BACKEND_URL` | `http://backend:5001/api/submit` | Where the frontend sends form submissions. The default assumes Docker Compose's internal DNS, this gets overridden in the Kubernetes and Terraform setups since the backend isn't reachable at that hostname in either of those. |
 
 **Routes:**
 
-| Method | Path      | Description                                 |
-|--------|-----------|---------------------------------------------|
-| GET    | `/`       | Renders the submission form                 |
-| POST   | `/submit` | Forwards form data to the Flask backend     |
-
----
+| Method | Path | What it does |
+|---|---|---|
+| GET | `/` | Renders the form |
+| POST | `/submit` | Forwards the submitted data to the Flask API |
 
 ## Backend
 
 **Stack:** Python 3.10, Flask, Flask-CORS, PyMongo, DNSPython
 
-The backend exposes a single REST endpoint that receives JSON, validates the fields, and inserts the document into a MongoDB Atlas collection (`tutedude_devops.submissions`).
+One route that takes JSON, checks the required fields are present, and inserts the document into MongoDB Atlas.
 
-| File               | Purpose                                             |
-|--------------------|-----------------------------------------------------|
-| `app.py`           | Flask app with `/api/submit` POST endpoint          |
-| `requirements.txt` | Dependencies: flask, flask-cors, pymongo, dnspython |
-| `Dockerfile`       | Python 3.10-slim image, exposes port 5001           |
+| File | Purpose |
+|---|---|
+| `app.py` | The Flask app, single `/api/submit` POST endpoint |
+| `requirements.txt` | flask, flask-cors, pymongo, dnspython |
+| `Dockerfile` | Python 3.10-slim, exposes port 5001 |
 
-**Key environment variable:**
+**Environment variable:**
 
-| Variable    | Description                        |
-|-------------|------------------------------------|
-| `MONGO_URI` | MongoDB Atlas connection string    |
+| Variable | Description |
+|---|---|
+| `MONGO_URI` | MongoDB Atlas connection string |
 
-**API Endpoint — `POST /api/submit`**
+Worth knowing: `app.py` has a hardcoded fallback value for `MONGO_URI` if the environment variable isn't set (`os.getenv("MONGO_URI", "<the actual connection string>")`). That's why the Kubernetes deployment works even though `backend-deployment.yaml` doesn't set `MONGO_URI` anywhere, it just falls through to the hardcoded default. It's convenient for getting something running quickly, but it does mean the real database credential lives directly in source control, not just in a `.env` file or a secret. If this app went anywhere near production, that fallback is the first thing to remove, along with rotating that password since it's currently sitting in plain text in this repo's history.
 
-Request body:
+**`POST /api/submit`**
+
+Request:
 ```json
 {
   "username": "john_doe",
@@ -93,67 +103,34 @@ Request body:
 }
 ```
 
-Success response `200`:
+Success (`200`):
 ```json
 { "success": true, "message": "Data processed successfully" }
 ```
 
-Error response `400`:
+Error (`400`, missing fields):
 ```json
 { "success": false, "error": "Missing required data fields" }
 ```
 
----
+## Option 1: Run it locally with Docker Compose
 
-## Service Ports
+The fastest way to just see the app working.
 
-| Service  | Host Port | Container Port |
-|----------|-----------|----------------|
-| Frontend | 3000      | 3000           |
-| Backend  | 5001      | 5001           |
-
----
-
-## Prerequisites
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-
-```bash
-docker --version
-docker compose version
-```
-
----
-
-## Docker Commands
-
-**Build and start all services:**
 ```bash
 docker compose up -d --build
 ```
 
-**Stop and remove containers:**
+Then open `http://localhost:3000`. Frontend and backend talk to each other over Compose's internal network (`devops_bridge_net`), the frontend reaches the backend at `http://backend:5001`.
+
 ```bash
-docker compose down
+docker compose logs -f              # watch logs
+docker compose ps                   # check what's running
+docker compose down                 # stop and remove containers
+docker compose build backend        # rebuild just one service
 ```
 
-**View logs:**
-```bash
-docker compose logs -f
-```
-
-**Check running containers:**
-```bash
-docker compose ps
-```
-
-**Rebuild a single service:**
-```bash
-docker compose build backend
-docker compose build frontend
-```
-
-**Tag and push images to Docker Hub:**
+Pushing images somewhere else (Docker Hub, in this case):
 ```bash
 docker tag devops-flask-backend <your-dockerhub-username>/devops-flask-backend:latest
 docker push <your-dockerhub-username>/devops-flask-backend:latest
@@ -162,19 +139,51 @@ docker tag devops-node-frontend <your-dockerhub-username>/devops-node-frontend:l
 docker push <your-dockerhub-username>/devops-node-frontend:latest
 ```
 
----
+## Option 2: Run it on Kubernetes
 
-## Running the App
+The `k8s/` folder has four manifests, one Deployment and one Service per app.
 
+| File | What it is |
+|---|---|
+| `backend-deployment.yaml` | 1 replica, pulls `aswinshine/flask-backend:v1` from Docker Hub, listens on 5001 |
+| `backend-service.yaml` | `ClusterIP`, internal only, not reachable from outside the cluster |
+| `frontend-deployment.yaml` | 1 replica, pulls `aswinshine/node-frontend:v1`, sets `BACKEND_URL` to `http://backend-service:5001/api/submit` |
+| `frontend-service.yaml` | `NodePort`, exposed on port `30080` on every node in the cluster |
+
+Apply all four:
 ```bash
-# 1. Navigate to the app directory
-cd Assignment-5/Assignment-5-app
-
-# 2. Build and start
-docker compose up -d --build
-
-# 3. Open in browser
-http://localhost:3000
+kubectl apply -f k8s/
 ```
 
-Fill in the form with a username and email — the data gets saved to MongoDB Atlas.
+Then hit `http://<any-node-ip>:30080` to reach the frontend. The backend is deliberately not exposed outside the cluster, `ClusterIP` means only things inside the cluster (like the frontend pod) can reach it, which is the right call for an internal API that doesn't need to be public.
+
+This assumes you already have a cluster to point `kubectl` at, minikube, kind, or a real managed cluster like EKS. These manifests don't create one.
+
+Both images here are pulled from Docker Hub, not ECR, that's a different registry from the one used in the Terraform/ECS setup mentioned below, if you're also working through that assignment. They're unrelated to each other.
+
+## Option 3: Full EC2 deployment with Jenkins CI/CD
+
+This is the more involved setup: Terraform provisions a single EC2 instance that runs Jenkins alongside both apps (managed by pm2 instead of Docker here), and Jenkins automatically redeploys either app whenever new code is pushed to GitHub.
+
+This is documented in full detail, including troubleshooting for the actual issues hit while building it, in the CI/CD assignment's own README (`terraform/` and `Jenkins/` in this repo are the real files that setup depends on). Short version:
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars: key_name, allowed_ssh_cidr, mongo_uri at minimum
+terraform init
+terraform validate
+terraform apply
+```
+
+This gives you a running EC2 instance with Jenkins on port 8080, the Express frontend on 3000, and the Flask backend on 5000 (patched from its default 5001, see the ports note above). Jenkins itself needs a few minutes of manual setup through its web UI afterward (initial admin password, plugin install, creating the two pipeline jobs, wiring up the GitHub webhook), none of that is scriptable through Terraform, it's a one-time click-through.
+
+Once that's done, `git push` to this repo triggers `Jenkinsfile.backend` and `Jenkinsfile.frontend` to redeploy whichever app changed, using `pm2 restart` rather than rebuilding containers, this deployment path doesn't use Docker at all, unlike Options 1 and 2.
+
+## Which option should you actually use
+
+- Just want to see the app run: Docker Compose.
+- Testing how it behaves on a real orchestrator, or already have a cluster: Kubernetes.
+- Need the actual CI/CD pipeline (the point of the Jenkins assignment): the Terraform/Jenkins setup. This one's also the only one of the three that isn't using Docker, everything runs as native processes under pm2 instead.
+
+They don't share infrastructure or state, running one doesn't affect or require the others.
