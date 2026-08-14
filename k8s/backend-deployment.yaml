@@ -19,3 +19,9 @@ spec:
         image: aswinshine/flask-backend:v1
         ports:
         - containerPort: 5001
+        env:
+        - name: MONGO_URI
+          valueFrom:
+            secretKeyRef:
+              name: mongo-secret
+              key: MONGO_URI
