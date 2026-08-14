@@ -1,16 +1,14 @@
-// Jenkins job config: Pipeline script path = "Jenkinsfile.backend"
-//
-// Deliberately NOT using a shared customWorkspace with the frontend
-// pipeline -- two jobs doing `checkout scm` into the same directory on
-// near-simultaneous pushes would race on git's index.lock. Each pipeline
-// gets Jenkins' normal per-job workspace, and only rsyncs its OWN
-// subfolder into the live /opt/app deploy path, so the two pipelines
-// never write to the same path even if they run concurrently.
 pipeline {
     agent any
 
     triggers {
         githubPush()
+    }
+
+    environment {
+        DEPLOY_DIR = '/opt/app/backend'
+        BACKUP_DIR = '/opt/app/backend.backup'
+        BACKEND_PORT = '5000'
     }
 
     stages {
@@ -20,20 +18,32 @@ pipeline {
             }
         }
 
+        stage('Backup current live version') {
+            steps {
+                sh '''
+                    if [ -d "$DEPLOY_DIR" ]; then
+                        rm -rf "$BACKUP_DIR"
+                        cp -a "$DEPLOY_DIR" "$BACKUP_DIR"
+                    fi
+                '''
+            }
+        }
+
         stage('Sync to deploy path') {
             steps {
-                sh 'rsync -a --delete --exclude venv backend/ /opt/app/backend/'
+                sh 'rsync -a --delete --exclude venv backend/ $DEPLOY_DIR/'
             }
         }
 
         stage('Install Dependencies') {
             steps {
-                dir('/opt/app/backend') {
+                dir("${env.DEPLOY_DIR}") {
                     sh '''
                         if [ ! -d venv ]; then
                             python3 -m venv venv
                         fi
                         ./venv/bin/pip install --no-cache-dir -r requirements.txt
+                        ./venv/bin/pip install --no-cache-dir pytest bandit pip-audit
                     '''
                 }
             }
@@ -41,26 +51,26 @@ pipeline {
 
         stage('Patch Port') {
             steps {
-                dir('/opt/app/backend') {
-                    // Repo hardcodes 5001; assignment wants 5000. A fresh
-                    // rsync from a clean checkout undoes this every time,
-                    // so it's reapplied on every build, not just the first.
+                dir("${env.DEPLOY_DIR}") {
                     sh "sed -i 's/port=5001/port=5000/' app.py"
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'gitleaks detect --source . --no-git -v'
+                    sh './venv/bin/bandit -r . -x ./venv,./tests || true'
+                    sh './venv/bin/pip-audit || true'
                 }
             }
         }
 
         stage('Test') {
             steps {
-                dir('/opt/app/backend') {
-                    sh '''
-                        if [ -d tests ] || ls test_*.py > /dev/null 2>&1; then
-                            ./venv/bin/pip install --no-cache-dir pytest
-                            ./venv/bin/pytest || true
-                        else
-                            echo "No tests found in backend/ -- skipping. Add a tests/ dir or test_*.py files to make this stage do real work."
-                        fi
-                    '''
+                dir("${env.DEPLOY_DIR}") {
+                    sh './venv/bin/pytest -v'
                 }
             }
         }
@@ -70,14 +80,38 @@ pipeline {
                 sh 'pm2 restart flask-backend'
             }
         }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    sleep 3
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                      -X POST http://localhost:$BACKEND_PORT/api/submit \
+                      -H "Content-Type: application/json" -d '{}')
+                    if [ "$STATUS" != "400" ]; then
+                        echo "Health check failed: expected 400, got $STATUS"
+                        exit 1
+                    fi
+                '''
+            }
+        }
     }
 
     post {
         failure {
-            echo 'Backend pipeline failed -- flask-backend was NOT restarted, previous version keeps running.'
+            sh '''
+                if [ -d "$BACKUP_DIR" ]; then
+                    echo "Rolling back to previous version"
+                    rm -rf "$DEPLOY_DIR"
+                    mv "$BACKUP_DIR" "$DEPLOY_DIR"
+                    pm2 restart flask-backend || true
+                else
+                    echo "No backup to roll back to, this was the first deploy."
+                fi
+            '''
         }
         success {
-            echo 'Backend deployed and restarted successfully.'
+            sh 'rm -rf "$BACKUP_DIR"'
         }
     }
 }

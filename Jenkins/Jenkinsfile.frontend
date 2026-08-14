@@ -1,11 +1,14 @@
-// Jenkins job config: Pipeline script path = "Jenkinsfile.frontend"
-// See Jenkinsfile.backend for why this uses its own workspace + rsync
-// instead of a shared customWorkspace.
 pipeline {
     agent any
 
     triggers {
         githubPush()
+    }
+
+    environment {
+        DEPLOY_DIR = '/opt/app/frontend'
+        BACKUP_DIR = '/opt/app/frontend.backup'
+        FRONTEND_PORT = '3000'
     }
 
     stages {
@@ -15,30 +18,52 @@ pipeline {
             }
         }
 
+        stage('Backup current live version') {
+            steps {
+                sh '''
+                    if [ -d "$DEPLOY_DIR" ]; then
+                        rm -rf "$BACKUP_DIR"
+                        cp -a "$DEPLOY_DIR" "$BACKUP_DIR"
+                    fi
+                '''
+            }
+        }
+
         stage('Sync to deploy path') {
             steps {
-                sh 'rsync -a --delete --exclude node_modules frontend/ /opt/app/frontend/'
+                sh 'rsync -a --delete --exclude node_modules frontend/ $DEPLOY_DIR/'
             }
         }
 
         stage('Install Dependencies') {
             steps {
-                dir('/opt/app/frontend') {
-                    sh 'npm install --production'
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'npm install'
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'gitleaks detect --source . --no-git -v'
+                    sh 'npm audit || true'
                 }
             }
         }
 
         stage('Test') {
             steps {
-                dir('/opt/app/frontend') {
-                    sh '''
-                        if node -e "process.exit(require('./package.json').scripts && require('./package.json').scripts.test ? 0 : 1)"; then
-                            npm test || true
-                        else
-                            echo "No test script in package.json -- skipping. Add one to make this stage do real work."
-                        fi
-                    '''
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'npx jest --ci'
+                }
+            }
+        }
+
+        stage('Prune to production deps') {
+            steps {
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'npm prune --production'
                 }
             }
         }
@@ -48,14 +73,36 @@ pipeline {
                 sh 'pm2 restart express-frontend'
             }
         }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    sleep 3
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$FRONTEND_PORT/)
+                    if [ "$STATUS" != "200" ]; then
+                        echo "Health check failed: expected 200, got $STATUS"
+                        exit 1
+                    fi
+                '''
+            }
+        }
     }
 
     post {
         failure {
-            echo 'Frontend pipeline failed -- express-frontend was NOT restarted, previous version keeps running.'
+            sh '''
+                if [ -d "$BACKUP_DIR" ]; then
+                    echo "Rolling back to previous version"
+                    rm -rf "$DEPLOY_DIR"
+                    mv "$BACKUP_DIR" "$DEPLOY_DIR"
+                    pm2 restart express-frontend || true
+                else
+                    echo "No backup to roll back to, this was the first deploy."
+                fi
+            '''
         }
         success {
-            echo 'Frontend deployed and restarted successfully.'
+            sh 'rm -rf "$BACKUP_DIR"'
         }
     }
 }
