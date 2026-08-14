@@ -17,7 +17,7 @@ services:
     ports:
       - "5001:5001"
     environment:
-      - MONGO_URI=mongodb+srv://ashwinsh91_db_user:NH56mlwbxJFyhORv@cluster0.9n2vi99.mongodb.net/tutedude?retryWrites=true&w=majority
+      - MONGO_URI=${MONGO_URI}
     networks:
       - devops_bridge_net
 
