@@ -91,7 +91,7 @@ One route that takes JSON, checks the required fields are present, and inserts t
 |---|---|
 | `MONGO_URI` | MongoDB Atlas connection string |
 
-Worth knowing: `app.py` has a hardcoded fallback value for `MONGO_URI` if the environment variable isn't set (`os.getenv("MONGO_URI", "<the actual connection string>")`). That's why the Kubernetes deployment works even though `backend-deployment.yaml` doesn't set `MONGO_URI` anywhere, it just falls through to the hardcoded default. It's convenient for getting something running quickly, but it does mean the real database credential lives directly in source control, not just in a `.env` file or a secret. If this app went anywhere near production, that fallback is the first thing to remove, along with rotating that password since it's currently sitting in plain text in this repo's history.
+`app.py` requires `MONGO_URI` to be set, no fallback, it raises a clear error at startup if it's missing rather than silently connecting with a default. That wasn't always true, earlier versions had a hardcoded connection string baked in as a fallback, which is also why `k8s/backend-deployment.yaml` now explicitly sources `MONGO_URI` from a Kubernetes Secret (`k8s/backend-secret.yaml.example` has the template and the real `kubectl create secret` command, never commit a filled-in version of that file). Removing the code-level fallback doesn't undo the fact that the original credential is still sitting in this repo's git history from earlier commits, if you're looking at this repo's actual history rather than just its current file contents, rotate that password in Atlas regardless of what the current code looks like.
 
 **`POST /api/submit`**
 
@@ -130,15 +130,6 @@ docker compose down                 # stop and remove containers
 docker compose build backend        # rebuild just one service
 ```
 
-Pushing images somewhere else (Docker Hub, in this case):
-```bash
-docker tag devops-flask-backend <your-dockerhub-username>/devops-flask-backend:latest
-docker push <your-dockerhub-username>/devops-flask-backend:latest
-
-docker tag devops-node-frontend <your-dockerhub-username>/devops-node-frontend:latest
-docker push <your-dockerhub-username>/devops-node-frontend:latest
-```
-
 ## Option 2: Run it on Kubernetes
 
 The `k8s/` folder has four manifests, one Deployment and one Service per app.
@@ -155,30 +146,35 @@ Apply all four:
 kubectl apply -f k8s/
 ```
 
-Then hit `http://<any-node-ip>:30080` to reach the frontend. The backend is deliberately not exposed outside the cluster, `ClusterIP` means only things inside the cluster (like the frontend pod) can reach it, which is the right call for an internal API that doesn't need to be public.
+Then hit `http://<any-node-ip>:30080` to reach the frontend. The backend stays `ClusterIP` on purpose, an internal API that doesn't need to be public shouldn't be.
 
 This assumes you already have a cluster to point `kubectl` at, minikube, kind, or a real managed cluster like EKS. These manifests don't create one.
 
-Both images here are pulled from Docker Hub, not ECR, that's a different registry from the one used in the Terraform/ECS setup mentioned below, if you're also working through that assignment. They're unrelated to each other.
-
 ## Option 3: Full EC2 deployment with Jenkins CI/CD
 
-This is the more involved setup: Terraform provisions a single EC2 instance that runs Jenkins alongside both apps (managed by pm2 instead of Docker here), and Jenkins automatically redeploys either app whenever new code is pushed to GitHub.
+This is the more involved setup: Terraform provisions a single EC2 instance that runs Jenkins alongside both apps (managed by pm2 instead of Docker here), and Jenkins automatically redeploys either app whenever new code is pushed to GitHub, running real tests, a security scan, a post-deploy health check, and rolling back automatically if any of those fail.
 
-This is documented in full detail, including troubleshooting for the actual issues hit while building it, in the CI/CD assignment's own README (`terraform/` and `Jenkins/` in this repo are the real files that setup depends on). Short version:
+This is documented in full detail, including troubleshooting for the actual issues hit while building it, in `Jenkins-CICD-Assignment.md` (`terraform/` and `Jenkins/` in this repo are the real files that setup depends on, not just described in that doc). Short version:
 
 ```bash
 cd terraform
 cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars: key_name, allowed_ssh_cidr, mongo_uri at minimum
+# edit terraform.tfvars: key_name, allowed_ssh_cidr at minimum
 terraform init
 terraform validate
 terraform apply
 ```
 
-This gives you a running EC2 instance with Jenkins on port 8080, the Express frontend on 3000, and the Flask backend on 5000 (patched from its default 5001, see the ports note above). Jenkins itself needs a few minutes of manual setup through its web UI afterward (initial admin password, plugin install, creating the two pipeline jobs, wiring up the GitHub webhook), none of that is scriptable through Terraform, it's a one-time click-through.
+`mongo_uri` isn't a Terraform variable, on purpose, the real Mongo connection string never flows through Terraform at all. After `apply`, set it once, out of band:
 
-Once that's done, `git push` to this repo triggers `Jenkinsfile.backend` and `Jenkinsfile.frontend` to redeploy whichever app changed, using `pm2 restart` rather than rebuilding containers, this deployment path doesn't use Docker at all, unlike Options 1 and 2.
+```bash
+aws secretsmanager put-secret-value --secret-id tutedude-cicd/mongo-uri \
+  --secret-string "<real atlas uri>" --region eu-north-1
+```
+
+This gives you a running EC2 instance with Jenkins on port 8080, the Express frontend on 3000, and the Flask backend on 5000 (patched from its default 5001, see the ports note above). VPC and instance provisioning use the official `terraform-aws-modules/vpc/aws` and `terraform-aws-modules/ec2-instance/aws` registry modules. Jenkins itself needs a few minutes of manual setup through its web UI afterward (initial admin password, plugin install, creating the two pipeline jobs, wiring up the GitHub webhook), none of that is scriptable through Terraform, it's a one-time click-through.
+
+Once that's done, `git push` to this repo triggers `Jenkinsfile.backend` and `Jenkinsfile.frontend`, each of which backs up the currently-running version, syncs the new code, installs dependencies, runs a Gitleaks secret scan (hard gate) plus Bandit/pip-audit or `npm audit` (advisory, report-only), runs the real test suite (`backend/tests/`, `frontend/tests/`), restarts the app under pm2, then hits it with a health check. Any failure along the way restores the backed-up version automatically instead of leaving a broken deploy live. A CloudWatch agent on the instance ships memory/disk metrics and the boot/Jenkins logs, there's no alerting wired to any of it though, that's still a manual check.
 
 ## Which option should you actually use
 

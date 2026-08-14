@@ -35,17 +35,27 @@ Jenkinsfile.backend and Jenkinsfile.frontend live at the repo root as actual fil
 
 ### The instance setup
 
-Default VPC, a security group opening SSH (my IP only), port 3000 (frontend), port 5000 (backend), and port 8080 (Jenkins), and one `t3.medium` running Ubuntu 22.04.
+The VPC, subnet, and the EC2 instance itself now come from the official `terraform-aws-modules/vpc/aws` and `terraform-aws-modules/ec2-instance/aws` registry modules, not hand-rolled resources, that was a rework after the first round of feedback specifically asked for it. A security group (kept as a plain resource, not a module, the ruleset is small enough that a module didn't buy much) opens SSH (my IP only), port 3000 (frontend), port 5000 (backend), and port 8080 (Jenkins). One `t3.medium` running Ubuntu 22.04.
 
-I bumped it up from `t3.micro` to `t3.medium` on purpose. Free tier only covers micro, but Jenkins plus two running apps plus whatever Jenkins needs to actually do a build (installing pip/npm packages, running tests) is more than a 1GB instance can handle without swapping constantly or just OOM-killing something mid-build. Costs a bit more, but the free-tier instance kept getting slow enough during builds that it wasn't worth fighting.
+I bumped it up from `t3.micro` to `t3.medium` on purpose. Free tier only covers micro, but Jenkins plus two running apps plus whatever Jenkins needs to actually do a build (installing pip/npm packages, running tests, now also Gitleaks/Bandit/pip-audit/npm audit) is more than a 1GB instance can handle without swapping constantly or just OOM-killing something mid-build. Costs a bit more, but the free-tier instance kept getting slow enough during builds that it wasn't worth fighting.
+
+The instance also gets an IAM role now, scoped to exactly two things: reading one specific Secrets Manager secret (the Mongo URI, more on that below) and the standard `CloudWatchAgentServerPolicy` for shipping logs and metrics. Neither existed in the first version of this.
 
 ### The boot script
 
-`user_data.sh.tpl` is what runs the first time the instance boots. It installs Python, Node, Java (Jenkins needs Java to run at all, it's a Java application under the hood), Jenkins itself, and pm2. Then it clones the app repo and sets both apps up.
+`user_data.sh.tpl` is what runs the first time the instance boots. It installs Python, Node, Java (Jenkins needs Java to run at all, it's a Java application under the hood), Jenkins itself, pm2, Gitleaks, and the CloudWatch agent. Then it clones the app repo and sets both apps up.
 
 One thing that tripped me up here: the app's Flask backend has its port hardcoded to 5001 in `app.py`, but the assignment specifically wants port 5000. I didn't want to edit the actual app code just to satisfy this one assignment's port number, so instead the boot script runs a `sed` command that swaps `port=5001` for `port=5000` right after cloning, on the deployed copy only. The tradeoff is that this patch has to be reapplied every time the code gets redeployed (since a fresh `git clone` or `git pull` would just bring back the original 5001), so the same `sed` line shows up again in the Jenkins pipeline for the backend.
 
 The other thing worth explaining is why everything after the Jenkins install runs as the `jenkins` Linux user specifically, instead of root. pm2 tracks running processes per user, it's basically a separate list for each person logged in. If I'd started the apps as root during the initial boot, then later had a Jenkins job (which runs as the `jenkins` user) try to run `pm2 restart flask-backend`, that command would be looking at the `jenkins` user's process list, which would be empty, since the process actually belongs to root's list. It would just fail with "process not found," not because the app isn't running, but because pm2 is checking the wrong bucket. Running the whole setup as `jenkins` from the start avoids that entirely.
+
+### The Mongo credential
+
+This one got flagged twice in feedback and I want to be straight about what actually changed. Originally `app.py` had a hardcoded fallback connection string baked into the file itself, so even if `MONGO_URI` was never set anywhere, the app would silently connect using that default. That's gone now, `app.py` raises an error at startup if `MONGO_URI` isn't set, no silent fallback.
+
+Where the real value lives now: AWS Secrets Manager, not Terraform, not any committed file. Terraform creates an empty secret container, the actual value gets set once manually with `aws secretsmanager put-secret-value`, a command that never touches this repo or Terraform's state. At boot, the instance fetches it itself using that IAM role mentioned above, scoped to read exactly that one secret and nothing else in the account.
+
+What this doesn't fix: the credential that was already committed to git history in earlier commits is still compromised regardless of what the code looks like now, editing files doesn't undo past commits. That password needs to actually get rotated in Atlas, which is a manual step outside of anything Terraform or Jenkins does.
 
 ### Things that broke while setting this up
 
@@ -91,11 +101,18 @@ This part is manual, Terraform installs Jenkins but doesn't configure it.
 ### Jenkinsfile.backend
 
 ```groovy
+// index.lock race if both pipelines run close together.
 pipeline {
     agent any
 
     triggers {
         githubPush()
+    }
+
+    environment {
+        DEPLOY_DIR = '/opt/app/backend'
+        BACKUP_DIR = '/opt/app/backend.backup'
+        BACKEND_PORT = '5000'
     }
 
     stages {
@@ -105,20 +122,32 @@ pipeline {
             }
         }
 
+        stage('Backup current live version') {
+            steps {
+                sh '''
+                    if [ -d "$DEPLOY_DIR" ]; then
+                        rm -rf "$BACKUP_DIR"
+                        cp -a "$DEPLOY_DIR" "$BACKUP_DIR"
+                    fi
+                '''
+            }
+        }
+
         stage('Sync to deploy path') {
             steps {
-                sh 'rsync -a --delete --exclude venv backend/ /opt/app/backend/'
+                sh 'rsync -a --delete --exclude venv backend/ $DEPLOY_DIR/'
             }
         }
 
         stage('Install Dependencies') {
             steps {
-                dir('/opt/app/backend') {
+                dir("${env.DEPLOY_DIR}") {
                     sh '''
                         if [ ! -d venv ]; then
                             python3 -m venv venv
                         fi
                         ./venv/bin/pip install --no-cache-dir -r requirements.txt
+                        ./venv/bin/pip install --no-cache-dir pytest bandit pip-audit
                     '''
                 }
             }
@@ -126,23 +155,27 @@ pipeline {
 
         stage('Patch Port') {
             steps {
-                dir('/opt/app/backend') {
+                dir("${env.DEPLOY_DIR}") {
                     sh "sed -i 's/port=5001/port=5000/' app.py"
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                dir("${env.DEPLOY_DIR}") {
+                    // Gitleaks blocks the build. Bandit/pip-audit report only.
+                    sh 'gitleaks detect --source . --no-git -v'
+                    sh './venv/bin/bandit -r . -x ./venv,./tests || true'
+                    sh './venv/bin/pip-audit || true'
                 }
             }
         }
 
         stage('Test') {
             steps {
-                dir('/opt/app/backend') {
-                    sh '''
-                        if [ -d tests ] || ls test_*.py > /dev/null 2>&1; then
-                            ./venv/bin/pip install --no-cache-dir pytest
-                            ./venv/bin/pytest || true
-                        else
-                            echo "No tests in backend/ yet, skipping"
-                        fi
-                    '''
+                dir("${env.DEPLOY_DIR}") {
+                    sh './venv/bin/pytest -v'
                 }
             }
         }
@@ -152,14 +185,40 @@ pipeline {
                 sh 'pm2 restart flask-backend'
             }
         }
+
+        stage('Health Check') {
+            steps {
+                // Empty POST, expect Flask's own 400 -- confirms the
+                // process is up without writing junk data to prod Mongo.
+                sh '''
+                    sleep 3
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                      -X POST http://localhost:$BACKEND_PORT/api/submit \
+                      -H "Content-Type: application/json" -d '{}')
+                    if [ "$STATUS" != "400" ]; then
+                        echo "Health check failed: expected 400, got $STATUS"
+                        exit 1
+                    fi
+                '''
+            }
+        }
     }
 
     post {
         failure {
-            echo 'Backend pipeline failed, flask-backend was not restarted, old version keeps running.'
+            sh '''
+                if [ -d "$BACKUP_DIR" ]; then
+                    echo "Rolling back to previous version"
+                    rm -rf "$DEPLOY_DIR"
+                    mv "$BACKUP_DIR" "$DEPLOY_DIR"
+                    pm2 restart flask-backend || true
+                else
+                    echo "No backup to roll back to, this was the first deploy."
+                fi
+            '''
         }
         success {
-            echo 'Backend deployed and restarted.'
+            sh 'rm -rf "$BACKUP_DIR"'
         }
     }
 }
@@ -169,18 +228,25 @@ Jenkins checks out the whole monorepo into its own workspace, then `rsync` copie
 
 The venv gets excluded from the rsync `--delete` so it doesn't get wiped and rebuilt from scratch on every single deploy, that would work but it's slower than it needs to be. The Install Dependencies step checks if the venv already exists before creating a new one.
 
-The test stage is honestly not doing much right now, the app doesn't have any tests yet, so it just checks whether a `tests/` folder or `test_*.py` files exist and skips cleanly if not, instead of failing the whole pipeline over something that was never there. If I add real tests later this stage would actually run them.
+This version has real tests now (`backend/tests/test_app.py`, pytest, mocking the actual database call so it doesn't need a live Mongo connection to run in CI), a hard-blocking Gitleaks scan before anything deploys (given this project's own history with a leaked credential, that's not hypothetical), Bandit and pip-audit running as report-only advisory scans, and a health check after the restart that POSTs an empty body and expects Flask's own 400 back, proving the process actually came back up without writing junk data into the real database on every deploy. If anything in the pipeline fails, from a bad test to a failed health check, the `post { failure {...} }` block restores whatever was running before (code and its installed dependencies both, backed up right at the start of the pipeline) and restarts pm2, instead of just logging that the old version is still running and leaving it at that.
 
 ![backend job build history in Jenkins](./Screenshots/Backend-Job.png)
 
 ### Jenkinsfile.frontend
 
 ```groovy
+// a shared one, and how the backup/rollback pattern works.
 pipeline {
     agent any
 
     triggers {
         githubPush()
+    }
+
+    environment {
+        DEPLOY_DIR = '/opt/app/frontend'
+        BACKUP_DIR = '/opt/app/frontend.backup'
+        FRONTEND_PORT = '3000'
     }
 
     stages {
@@ -190,30 +256,52 @@ pipeline {
             }
         }
 
+        stage('Backup current live version') {
+            steps {
+                sh '''
+                    if [ -d "$DEPLOY_DIR" ]; then
+                        rm -rf "$BACKUP_DIR"
+                        cp -a "$DEPLOY_DIR" "$BACKUP_DIR"
+                    fi
+                '''
+            }
+        }
+
         stage('Sync to deploy path') {
             steps {
-                sh 'rsync -a --delete --exclude node_modules frontend/ /opt/app/frontend/'
+                sh 'rsync -a --delete --exclude node_modules frontend/ $DEPLOY_DIR/'
             }
         }
 
         stage('Install Dependencies') {
             steps {
-                dir('/opt/app/frontend') {
-                    sh 'npm install --production'
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'npm install'
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'gitleaks detect --source . --no-git -v'
+                    sh 'npm audit || true'
                 }
             }
         }
 
         stage('Test') {
             steps {
-                dir('/opt/app/frontend') {
-                    sh '''
-                        if node -e "process.exit(require('./package.json').scripts && require('./package.json').scripts.test ? 0 : 1)"; then
-                            npm test || true
-                        else
-                            echo "No test script in package.json, skipping"
-                        fi
-                    '''
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'npx jest --ci'
+                }
+            }
+        }
+
+        stage('Prune to production deps') {
+            steps {
+                dir("${env.DEPLOY_DIR}") {
+                    sh 'npm prune --production'
                 }
             }
         }
@@ -223,20 +311,42 @@ pipeline {
                 sh 'pm2 restart express-frontend'
             }
         }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    sleep 3
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$FRONTEND_PORT/)
+                    if [ "$STATUS" != "200" ]; then
+                        echo "Health check failed: expected 200, got $STATUS"
+                        exit 1
+                    fi
+                '''
+            }
+        }
     }
 
     post {
         failure {
-            echo 'Frontend pipeline failed, express-frontend was not restarted, old version keeps running.'
+            sh '''
+                if [ -d "$BACKUP_DIR" ]; then
+                    echo "Rolling back to previous version"
+                    rm -rf "$DEPLOY_DIR"
+                    mv "$BACKUP_DIR" "$DEPLOY_DIR"
+                    pm2 restart express-frontend || true
+                else
+                    echo "No backup to roll back to, this was the first deploy."
+                fi
+            '''
         }
         success {
-            echo 'Frontend deployed and restarted.'
+            sh 'rm -rf "$BACKUP_DIR"'
         }
     }
 }
 ```
 
-Same idea as the backend one, just no port patch needed since Express is already on the right port (3000) by default in this repo.
+Same idea as the backend one, no port patch needed since Express is already on the right port (3000) by default in this repo. Real tests now too (`frontend/tests/server.test.js`, Jest + Supertest, with `axios` mocked so it doesn't need a real backend running to test against), which needed one small change to `server.js` first, exporting the Express `app` object and guarding `app.listen()` behind `require.main === module`, since it previously called `.listen()` unconditionally and wasn't importable for testing at all. Same Gitleaks/npm-audit scan pattern, same backup-and-restore rollback on failure, same health check idea, just checking port 3000 answers with a 200 instead of checking Flask's validation response.
 
 ![frontend job build history in Jenkins](./Screenshots/Frontend-Job.png)
 
@@ -252,11 +362,13 @@ Repo Settings, Webhooks, Add webhook, Payload URL `http://<instance-ip>:8080/git
 
 ## What I'd still want to fix
 
-I'm not going to pretend this setup is production ready, because it isn't, and I think that's fine for what this assignment is asking for, but worth being upfront about:
+I'm not going to pretend this setup is production ready, because it isn't, and I think that's fine for what this assignment is asking for, but worth being upfront about what's actually still open versus what got fixed in the second pass:
 
-- Everything, Jenkins, the frontend, and the backend, lives on one instance. If that instance runs out of disk from Jenkins build history, or Jenkins itself crashes, the live apps go down with it. In a real setup I'd want the CI runner separate from wherever the app actually runs.
-- Jenkins' login page is open to the whole internet on port 8080, since the GitHub webhook needs a way to reach it. That's a real tradeoff, not something I've solved, just something I'm aware of.
-- There's no rollback if a bad deploy gets pushed through. Right now the test stage barely does anything since there aren't real tests yet, so a broken commit would probably just get deployed straight to pm2.
+- Everything, Jenkins, the frontend, and the backend, lives on one instance. If that instance runs out of disk from Jenkins build history, or Jenkins itself crashes, the live apps go down with it. In a real setup I'd want the CI runner separate from wherever the app actually runs. Still true, didn't touch this.
+- Jenkins' login page is open to the whole internet on port 8080, since the GitHub webhook needs a way to reach it. Still true, still not solved, just something I'm aware of.
+- Rollback is real now, not just documented as missing. Each pipeline backs up the currently-running version (code and its installed dependencies) before deploying, and restores it automatically if any stage fails, tests, the security scan, or the health check after restart. What this doesn't cover: a bad deploy that passes every check but is still wrong in some way none of them test for. No automated system here would catch that, someone still has to notice.
+- Security scanning is in the pipeline now too, Gitleaks as a hard gate (given this project already had a real credential leak, that's not a hypothetical risk), Bandit/pip-audit/npm audit as advisory reports that don't block the build.
+- Monitoring exists now (CloudWatch agent shipping memory/disk metrics and the boot + Jenkins logs), but there's no alerting attached to any of it. Something can go visibly wrong in CloudWatch and nothing pages anyone, I'd still have to go looking.
 - The port patch (`sed`ing 5001 to 5000) happens in two places now, the boot script and the backend Jenkinsfile, because both need it independently. If that exact line in `app.py` ever gets rewritten slightly, the sed just quietly stops matching and does nothing, no error, the app just comes up on the wrong port with no obvious explanation. The actual fix would be reading the port from an environment variable in the app itself instead of patching around it after the fact, I just didn't want to change the app code for a one-off assignment requirement.
 
 <div align="center">
