@@ -8,7 +8,12 @@ app = Flask(__name__)
 CORS(app)
 
 # Fallback URI connection configuration
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://ashwinsh91_db_user:NH56mlwbxJFyhORv@cluster0.9n2vi99.mongodb.net/tutedude?retryWrites=true&w=majority")
+MONGO_URI = os.environ.get("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError(
+        "MONGO_URI environment variable is not set. "
+        "This app will not start without it -- no hardcoded fallback exists on purpose."
+    )
 
 try:
     client = MongoClient(MONGO_URI)
