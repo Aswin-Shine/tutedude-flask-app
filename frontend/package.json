@@ -3,9 +3,16 @@
   "version": "1.0.0",
   "description": "Express UI engine for DevOps blocks",
   "main": "server.js",
+  "scripts": {
+    "test": "jest"
+  },
   "dependencies": {
     "axios": "^1.6.0",
     "ejs": "^3.1.9",
     "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4"
   }
 }
