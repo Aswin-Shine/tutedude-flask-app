@@ -1,12 +1,5 @@
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
 data "aws_ami" "ubuntu" {
@@ -24,10 +17,30 @@ data "aws_ami" "ubuntu" {
   }
 }
 
+# VPC via terraform-aws-modules
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "${var.project_name}-vpc"
+  cidr = var.vpc_cidr
+
+  azs            = [data.aws_availability_zones.available.names[0]]
+  public_subnets = [var.public_subnet_cidr]
+
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  private_subnets      = []
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
 resource "aws_security_group" "app_and_jenkins_sg" {
   name        = "${var.project_name}-sg"
   description = "SSH, Flask, Express, Jenkins UI"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = module.vpc.vpc_id
 
   ingress {
     description = "SSH"
@@ -74,26 +87,81 @@ resource "aws_security_group" "app_and_jenkins_sg" {
   }
 }
 
-resource "aws_instance" "app_and_jenkins" {
+# AWS Secret Manager
+resource "aws_secretsmanager_secret" "mongo_uri" {
+  name        = var.mongo_secret_name
+  description = "MongoDB Atlas connection string for the Flask backend. Value set out-of-band, not by Terraform."
+}
+
+resource "aws_iam_role" "app_instance_role" {
+  name = "${var.project_name}-instance-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "read_mongo_secret" {
+  name = "${var.project_name}-read-mongo-secret"
+  role = aws_iam_role.app_instance_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.mongo_uri.arn
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
+  role       = aws_iam_role.app_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+resource "aws_iam_instance_profile" "app_instance_profile" {
+  name = "${var.project_name}-instance-profile"
+  role = aws_iam_role.app_instance_role.name
+}
+
+module "app_and_jenkins" {
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "~> 5.6"
+
+  name = "${var.project_name}-app-and-jenkins"
+
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   key_name               = var.key_name
-  subnet_id              = data.aws_subnets.default.ids[0]
+  subnet_id              = module.vpc.public_subnets[0]
   vpc_security_group_ids = [aws_security_group.app_and_jenkins_sg.id]
 
+  associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.app_instance_profile.name
+
   user_data = templatefile("${path.module}/templates/user_data.sh.tpl", {
-    github_repo_url = var.github_repo_url
-    backend_port    = var.backend_port
-    frontend_port   = var.frontend_port
-    mongo_uri       = var.mongo_uri
+    github_repo_url   = var.github_repo_url
+    backend_port      = var.backend_port
+    frontend_port     = var.frontend_port
+    aws_region        = var.aws_region
+    mongo_secret_name = var.mongo_secret_name
+    project_name      = var.project_name
   })
   user_data_replace_on_change = true
 
-  root_block_device {
-    volume_size = 20 # Jenkins + build workspace needs more than the 15GB used in the other assignment's boxes
-    volume_type = "gp3"
-    encrypted   = true
-  }
+  root_block_device = [
+    {
+      volume_size = 20
+      volume_type = "gp3"
+      encrypted   = true
+    }
+  ]
 
   tags = {
     Name = "${var.project_name}-app-and-jenkins"

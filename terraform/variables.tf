@@ -11,7 +11,7 @@ variable "project_name" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. Jenkins + both apps on one box needs real RAM -- t3.micro (free tier) will likely OOM once Jenkins is running builds. t3.medium is NOT free-tier eligible; override to t3.micro in tfvars if you want to test that limit yourself first."
+  description = "EC2 instance type"
   type        = string
   default     = "t3.medium"
 }
@@ -27,7 +27,7 @@ variable "allowed_ssh_cidr" {
 }
 
 variable "github_repo_url" {
-  description = "HTTPS URL of the app repo (monorepo containing both backend/ and frontend/)"
+  description = "HTTPS URL of the app repo"
   type        = string
   default     = "https://github.com/Aswin-Shine/tutedude-flask-app.git"
 }
@@ -50,8 +50,20 @@ variable "jenkins_port" {
   default     = 8080
 }
 
-variable "mongo_uri" {
-  description = "MongoDB Atlas connection string for the Flask backend. No default on purpose -- set the real value in terraform.tfvars (gitignored), not here (this file gets committed)."
+variable "mongo_secret_name" {
+  description = "Name of the AWS Secrets Manager secret holding the Mongo URI."
   type        = string
-  sensitive   = true
+  default     = "tutedude-cicd/mongo-uri"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC created by the official terraform-aws-modules/vpc/aws module"
+  type        = string
+  default     = "10.2.0.0/16"
+}
+
+variable "public_subnet_cidr" {
+  description = "CIDR block for the single public subnet the instance sits in"
+  type        = string
+  default     = "10.2.1.0/24"
 }
